@@ -1,930 +1,745 @@
 package main
 
 import (
-	"bytes"
-	"fmt"
 	"image"
-	"math"
-	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-
-	"github.com/macroblock/imed/pkg/ptool"
 )
 
-var pdxRule = `
-	entry                = '' scopeBody$;
+// spriteTypeKeys are the .gfx entries that carry a name and a texture we can
+// draw. Anything else in the file is ignored.
+var spriteTypeKeys = map[string]bool{
+	"spritetype":              true,
+	"corneredtilespritetype":  true,
+	"frameanimatedspritetype": true,
+	"maskedshieldtype":        true,
+	"textspritetype":          true,
+	"progressbartype":         true,
+	"circularprogressbartype": true,
+}
 
-	declr                = lval '=' rval [';'] [@comment];
-	declrScope           = lval '=' scope [';'] [@comment];
-	comparison           = lval @operators rval [';'] [@comment];
-	list                 = @anyType {@anyType} [';']  [@comment];
+// ---------------------------------------------------------------- focus trees
 
-	lval                 = @date|@int|@var|'"'#@string#'"';
-	rval                 = @date|@hex|@percent|@var|@number|'"'#@string#'"';
+type focusFile struct {
+	Path       string
+	TreeIDs    []string
+	SharedRefs []string
+	Focuses    []Focus
+	HasShared  bool
+}
 
-	scope                = '{' (scopeBody|@empty) ('}'|empty);
-	scopeBody            = (@declr|@declrScope|@comparison|@list){@declr|@declrScope|@comparison|@list};
-	comment              = '#'#{#!\x0a#!\x0d#!$#anyRune};
-
-	int                  = ['-']digit#{#digit};
-	float                = ['-'][int]#'.'#int;
-	number               = float|int;
-	percent              = int#'%'#'%';
-	string               = {!'"'#stringChar};
-	var                  = symbol#{#symbol};
-	date                 = int#'.'#int#'.'#int#['.'#int];
-	bool                 = 'yes'|'no';
-	hex                  = '0x'#(digit|letter)(digit|letter)(digit|letter)(digit|letter)(digit|letter)(digit|letter)(digit|letter)(digit|letter);
-	anyType              = number|percent|'"'#string#'"'|var|date|bool|hex;
-
-	                     = {spaces|@comment};
-	spaces               = \x00..\x20;
-	anyRune              = \x00..$;
-	digit                = '0'..'9';
-	letter               = 'a'..'z'|'A'..'Z'|'а'..'я'|'А'..'Я'|\u00c0..\u00d6|\u00d8..\u00f6|\u00f8..\u00ff|\u0100..\u017f|\u0180..\u024f|\u0400..\u04ff|\u0500..\u052f;
-	operators            = '<'|'>';
-	symbol               = digit|letter|'_'|':'|'@'|'.'|'-'|'^'|\u0027;
-	stringChar           = ('\"'|anyRune);
-	empty                = '';
-`
-
-// pair                 = @key ':' [@number] '"'#@value#'"' [@comment];
-
-var ymlRule = `
-	entry                = @language#':' {@pair};
-
-	pair                 = @key ':' [@number] @value [@comment];
-	comment              = '#'#{#!\x0a#!\x0d#!$#anyRune};
-
-	language             = 'l_'#symbol#{#symbol};
-	key                  = symbol#{#symbol};
-	number               = digit#{#digit};
-	value                = '"'#{#anyRune};
-
-	                     = {spaces|@comment};
-	spaces               = \x00..\x20;
-	anyRune              = \x00..\x09|\x0b..\x0c|\x0e..$;
-	digit                = '0'..'9';
-	letter               = 'a'..'z'|'A'..'Z'|'а'..'я'|'А'..'Я'|\u00c0..\u00d6|\u00d8..\u00f6|\u00f8..\u00ff|\u0100..\u017f|\u0180..\u024f|\u0400..\u04ff|\u0500..\u052f;
-	symbol               = digit|letter|'_'|'@'|'.'|'-';
-	empty                = '';
-`
-
-func parseFocus(path string) error {
-	fmt.Println(path)
-	f, err := readFile(path)
+// parseFocusFile reads one national_focus file.
+func parseFocusFile(path string) (*focusFile, error) {
+	src, err := readFileText(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	if len(f) > 0 {
-		// Remove utf-8 bom if found.
-		if bytes.HasPrefix([]byte(f), utf8bom) {
-			f = string(bytes.TrimPrefix([]byte(f), utf8bom))
-		}
-
-		node, err := pdx.Parse(f)
-		if err != nil {
-			return err
-		}
-		_ = node
-		// fmt.Println(ptool.TreeToString(node, pdx.ByID))
-		err = traverseFocus(node)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	res := &focusFile{Path: path}
+	root := ParsePDX(src, filepath.Base(path))
+	collectFocuses(root, res, filepath.Base(path), false)
+	return res, nil
 }
 
-func traverseFocus(root *ptool.TNode) error {
-	for _, node := range root.Links {
-		nodeType := pdx.ByID(node.Type)
-		switch nodeType {
-		case "declrScope":
-			switch strings.ToLower(node.Links[0].Value) {
-			case "focus", "shared_focus":
-				var f Focus
-				f.AllowBranch = true
-				f.Available = true
-				var err error
-				var n float64
-				for _, link := range node.Links {
-					nodeType := pdx.ByID(link.Type)
-					switch nodeType {
-					case "declr":
-						switch strings.ToLower(link.Links[0].Value) {
-						case "id":
-							f.ID = link.Links[1].Value
-							locList = append(locList, link.Links[1].Value)
-						case "icon":
-							f.Icon = link.Links[1].Value
-							gfxList = append(gfxList, "\""+link.Links[1].Value+"\"")
-						case "text":
-							f.Text = link.Links[1].Value
-							locList = append(locList, link.Links[1].Value)
-						case "x":
-							n, err = strconv.ParseFloat(link.Links[1].Value, 64)
-							if err != nil {
-								return err
-							}
-							f.X = int(math.Trunc(n))
-						case "y":
-							n, err = strconv.ParseFloat(link.Links[1].Value, 64)
-							if err != nil {
-								return err
-							}
-							f.Y = int(math.Trunc(n))
-						case "relative_position_id":
-							f.RelativePositionID = link.Links[1].Value
-						}
-					case "declrScope":
-						switch strings.ToLower(link.Links[0].Value) {
-						case "prerequisite":
-							var p []string
-							for _, link := range link.Links {
-								nodeType := pdx.ByID(link.Type)
-								switch nodeType {
-								case "declr":
-									switch strings.ToLower(link.Links[0].Value) {
-									case "focus":
-										p = append(p, link.Links[1].Value)
-									}
-								}
-							}
-							f.Prerequisite = append(f.Prerequisite, p)
-						case "mutually_exclusive":
-							for _, link := range link.Links {
-								nodeType := pdx.ByID(link.Type)
-								switch nodeType {
-								case "declr":
-									switch strings.ToLower(link.Links[0].Value) {
-									case "focus":
-										f.MutuallyExclusive = append(f.MutuallyExclusive, link.Links[1].Value)
-									}
-								}
-							}
-						case "allow_branch":
-							for _, link := range link.Links {
-								nodeType := pdx.ByID(link.Type)
-								switch nodeType {
-								case "declr":
-									switch strings.ToLower(link.Links[0].Value) {
-									case "always":
-										if strings.ToLower(link.Links[1].Value) == "no" {
-											f.AllowBranch = false
-										}
-									case "has_country_flag":
-										if strings.ToLower(link.Links[1].Value) == "romanov_enabled" { // Poland tree workaround
-											f.AllowBranch = false
-										}
-									}
-								case "declrScope":
-									switch strings.ToLower(link.Links[0].Value) {
-									case "not":
-										for _, link := range link.Links {
-											nodeType := pdx.ByID(link.Type)
-											switch nodeType {
-											case "declr":
-												switch strings.ToLower(link.Links[0].Value) {
-												case "has_dlc":
-													f.AllowBranch = false
-												}
-											}
-										}
-									}
-								}
-							}
-						case "available":
-							for _, link := range link.Links {
-								if len(link.Links) > 0 {
-									f.Available = false
-								}
-							}
-						}
-					}
+// collectFocuses walks the top level of a focus file. It deliberately does not
+// descend into effect or trigger scopes: "focus = X" inside a prerequisite is
+// a reference, not a definition.
+func collectFocuses(blk *PBlock, res *focusFile, source string, insideTree bool) {
+	if blk == nil {
+		return
+	}
+	for _, n := range blk.Nodes {
+		key := strings.ToLower(n.Key)
+		switch {
+		case key == "focus_tree" && n.Block != nil:
+			if id := n.Block.Str("id"); id != "" {
+				res.TreeIDs = append(res.TreeIDs, id)
+			}
+			collectFocuses(n.Block, res, source, true)
+
+		case key == "shared_focus":
+			if n.Block != nil {
+				res.HasShared = true
+				if f, ok := focusFromBlock(n.Block, true, source); ok {
+					res.Focuses = append(res.Focuses, f)
 				}
-				focusMap[f.ID] = f
-			default:
-				err := traverseFocus(node)
-				if err != nil {
-					return err
-				}
+			} else if n.Value != "" {
+				res.SharedRefs = append(res.SharedRefs, n.Value)
+			}
+
+		case key == "focus" && n.Block != nil:
+			if f, ok := focusFromBlock(n.Block, false, source); ok {
+				res.Focuses = append(res.Focuses, f)
+			}
+
+		case n.Block != nil && !insideTree && key != "focus_tree":
+			// Wrapper scopes some mods use around their trees.
+			if key == "country" || key == "default" || key == "continuous_focus_position" {
+				continue
+			}
+			collectFocuses(n.Block, res, source, insideTree)
+		}
+	}
+}
+
+func focusFromBlock(blk *PBlock, shared bool, source string) (Focus, bool) {
+	var f Focus
+	f.AllowBranch = true
+	f.Available = true
+	f.Shared = shared
+	f.Source = source
+
+	f.ID = blk.Str("id")
+	if f.ID == "" {
+		warnf("%v: a focus without an id was skipped (line %v)", source, blk.Line)
+		return f, false
+	}
+
+	if n := blk.Get("icon"); n != nil {
+		f.Icon = pickDynamicValue(n, "icon")
+	}
+	if n := blk.Get("text"); n != nil {
+		f.Text = pickDynamicValue(n, "text")
+	}
+
+	if v, ok := blk.Int("x"); ok {
+		f.X = v
+	} else if blk.Has("x") {
+		warnf("%v: focus %v has an x coordinate that is not a number, using 0", source, f.ID)
+	}
+	if v, ok := blk.Int("y"); ok {
+		f.Y = v
+	} else if blk.Has("y") {
+		warnf("%v: focus %v has a y coordinate that is not a number, using 0", source, f.ID)
+	}
+
+	f.RelativePositionID = blk.Str("relative_position_id")
+
+	for _, p := range blk.GetAll("prerequisite") {
+		if p.Block == nil {
+			continue
+		}
+		var group []string
+		for _, fn := range p.Block.GetAll("focus") {
+			if fn.Value != "" {
+				group = append(group, fn.Value)
+			}
+		}
+		if len(group) > 0 {
+			f.Prerequisite = append(f.Prerequisite, group)
+		}
+	}
+
+	for _, m := range blk.GetAll("mutually_exclusive") {
+		if m.Block == nil {
+			continue
+		}
+		for _, fn := range m.Block.GetAll("focus") {
+			if fn.Value != "" {
+				f.MutuallyExclusive = append(f.MutuallyExclusive, fn.Value)
 			}
 		}
 	}
-	return nil
+
+	if n := blk.Get("allow_branch"); n != nil && n.Block != nil {
+		f.AllowBranch = evalAllowBranch(n.Block)
+	}
+
+	if n := blk.Get("available"); n != nil && n.Block != nil {
+		if len(n.Block.Nodes) > 0 || len(n.Block.Values) > 0 {
+			f.Available = false
+		}
+	}
+
+	return f, true
 }
 
-func parseGUI(path string) error {
-	fPath := filepath.Join(path, "interface", "nationalfocusview.gui")
-	fmt.Println(fPath)
+// tri is a three valued result: a trigger we can decide, or one we cannot.
+type tri int
 
-	f, err := readFile(fPath)
-	if err != nil {
-		return err
+const (
+	triUnknown tri = iota
+	triTrue
+	triFalse
+)
+
+func (t tri) not() tri {
+	switch t {
+	case triTrue:
+		return triFalse
+	case triFalse:
+		return triTrue
 	}
-
-	if len(f) > 0 {
-		// Remove utf-8 bom if found.
-		if bytes.HasPrefix([]byte(f), utf8bom) {
-			f = string(bytes.TrimPrefix([]byte(f), utf8bom))
-		}
-
-		node, err := pdx.Parse(f)
-		if err != nil {
-			return err
-		}
-		_ = node
-		// fmt.Println(ptool.TreeToString(node, pdx.ByID))
-		err = traverseGUI(node)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return triUnknown
 }
 
-func traverseGUI(root *ptool.TNode) error {
-	var err error
-	for _, node := range root.Links {
-		nodeType := pdx.ByID(node.Type)
-		switch nodeType {
-		case "declrScope":
-			switch strings.ToLower(node.Links[0].Value) {
-			case "containerwindowtype":
-				nfv := false
-				nfi := false
-				nfl := false
-				nfei := false
-				for _, link := range node.Links {
-					if pdx.ByID(link.Type) == "declr" {
-						if strings.ToLower(link.Links[0].Value) == "name" && link.Links[1].Value == "nationalfocusview" {
-							nfv = true
-						}
-						if strings.ToLower(link.Links[0].Value) == "name" && link.Links[1].Value == "national_focus_item" {
-							nfi = true
-						}
-						if strings.ToLower(link.Links[0].Value) == "name" && link.Links[1].Value == "national_focus_link" {
-							nfl = true
-						}
-						if strings.ToLower(link.Links[0].Value) == "name" && link.Links[1].Value == "national_focus_exclusive_item" {
-							nfei = true
-						}
-					}
-				}
-
-				switch {
-				case nfv:
-					for _, link := range node.Links {
-						if len(link.Links) > 0 {
-							switch strings.ToLower(link.Links[0].Value) {
-							case "instanttextboxtype":
-								var t InstantTextboxType
-								for _, link := range link.Links {
-									if len(link.Links) > 0 {
-										switch strings.ToLower(link.Links[0].Value) {
-										case "name":
-											t.Name = link.Links[1].Value
-										case "position":
-											for _, link := range link.Links {
-												nodeType := pdx.ByID(link.Type)
-												switch nodeType {
-												case "declr":
-													switch strings.ToLower(link.Links[0].Value) {
-													case "x":
-														t.Position.X, err = strconv.Atoi(link.Links[1].Value)
-														if err != nil {
-															return err
-														}
-													case "y":
-														t.Position.Y, err = strconv.Atoi(link.Links[1].Value)
-														if err != nil {
-															return err
-														}
-													}
-												}
-											}
-										case "font":
-											t.Font = link.Links[1].Value
-											gfxList = append(gfxList, "\""+link.Links[1].Value+"\"")
-										case "text":
-											t.Text = link.Links[1].Value
-										case "maxwidth":
-											t.MaxWidth, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										case "maxheight":
-											t.MaxHeight, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										case "format":
-											t.Format = link.Links[1].Value
-										case "vertical_alignment":
-											t.VerticalAlignment = link.Links[1].Value
-										}
-									}
-								}
-								if t.Name == "national_focus_title" {
-									gui.NationalFocusTitle = t
-								}
-							}
-						}
-					}
-
-				case nfi:
-					for _, link := range node.Links {
-						if len(link.Links) > 0 {
-							switch strings.ToLower(link.Links[0].Value) {
-							case "name":
-								gui.NationalFocusItem.Name = link.Links[1].Value
-							case "position":
-								for _, link := range link.Links {
-									nodeType := pdx.ByID(link.Type)
-									switch nodeType {
-									case "declr":
-										switch strings.ToLower(link.Links[0].Value) {
-										case "x":
-											gui.NationalFocusItem.Position.X, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										case "y":
-											gui.NationalFocusItem.Position.Y, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										}
-									}
-								}
-							case "size":
-								for _, link := range link.Links {
-									nodeType := pdx.ByID(link.Type)
-									switch nodeType {
-									case "declr":
-										switch strings.ToLower(link.Links[0].Value) {
-										case "width":
-											gui.NationalFocusItem.Width, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										case "height":
-											gui.NationalFocusItem.Height, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										}
-									}
-								}
-							case "buttontype":
-								var button ButtonType
-								for _, link := range link.Links {
-									if len(link.Links) > 0 {
-										switch strings.ToLower(link.Links[0].Value) {
-										case "name":
-											button.Name = link.Links[1].Value
-										case "position":
-											for _, link := range link.Links {
-												nodeType := pdx.ByID(link.Type)
-												switch nodeType {
-												case "declr":
-													switch strings.ToLower(link.Links[0].Value) {
-													case "x":
-														button.Position.X, err = strconv.Atoi(link.Links[1].Value)
-														if err != nil {
-															return err
-														}
-													case "y":
-														button.Position.Y, err = strconv.Atoi(link.Links[1].Value)
-														if err != nil {
-															return err
-														}
-													}
-												}
-											}
-										case "spritetype":
-											button.SpriteType = link.Links[1].Value
-											gfxList = append(gfxList, "\""+link.Links[1].Value+"\"")
-										case "quadtexturesprite":
-											button.SpriteType = link.Links[1].Value
-											gfxList = append(gfxList, "\""+link.Links[1].Value+"\"")
-										case "centerposition":
-											button.CenterPosition = link.Links[1].Value
-										case "orientation":
-											button.Orientation = link.Links[1].Value
-										}
-									}
-								}
-								switch strings.ToLower(button.Name) {
-								case "bg":
-									gui.BG = button
-								case "symbol":
-									gui.Symbol = button
-								}
-							case "instanttextboxtype":
-								name := false
-								for _, link := range link.Links {
-									if pdx.ByID(link.Type) == "declr" {
-										if strings.ToLower(link.Links[0].Value) == "name" && link.Links[1].Value == "name" {
-											name = true
-										}
-									}
-								}
-								if name {
-									for _, link := range link.Links {
-										if len(link.Links) > 0 {
-											switch strings.ToLower(link.Links[0].Value) {
-											case "name":
-												gui.Name.Name = link.Links[1].Value
-											case "position":
-												for _, link := range link.Links {
-													nodeType := pdx.ByID(link.Type)
-													switch nodeType {
-													case "declr":
-														switch strings.ToLower(link.Links[0].Value) {
-														case "x":
-															gui.Name.Position.X, err = strconv.Atoi(link.Links[1].Value)
-															if err != nil {
-																return err
-															}
-														case "y":
-															gui.Name.Position.Y, err = strconv.Atoi(link.Links[1].Value)
-															if err != nil {
-																return err
-															}
-														}
-													}
-												}
-											case "font":
-												gui.Name.Font = link.Links[1].Value
-												gfxList = append(gfxList, "\""+link.Links[1].Value+"\"")
-											case "text":
-												gui.Name.Text = link.Links[1].Value
-											case "maxwidth":
-												gui.Name.MaxWidth, err = strconv.Atoi(link.Links[1].Value)
-												if err != nil {
-													return err
-												}
-											case "maxheight":
-												gui.Name.MaxHeight, err = strconv.Atoi(link.Links[1].Value)
-												if err != nil {
-													return err
-												}
-											case "format":
-												gui.Name.Format = link.Links[1].Value
-											case "vertical_alignment":
-												gui.Name.VerticalAlignment = link.Links[1].Value
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-
-				case nfl:
-					for _, link := range node.Links {
-						if len(link.Links) > 0 {
-							switch strings.ToLower(link.Links[0].Value) {
-							case "name":
-								gui.NationalFocusLink.Name = link.Links[1].Value
-							case "position":
-								for _, link := range link.Links {
-									nodeType := pdx.ByID(link.Type)
-									switch nodeType {
-									case "declr":
-										switch strings.ToLower(link.Links[0].Value) {
-										case "x":
-											gui.NationalFocusLink.Position.X, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										case "y":
-											gui.NationalFocusLink.Position.Y, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										}
-									}
-								}
-							case "size":
-								for _, link := range link.Links {
-									nodeType := pdx.ByID(link.Type)
-									switch nodeType {
-									case "declr":
-										switch strings.ToLower(link.Links[0].Value) {
-										case "width":
-											gui.NationalFocusLink.Width, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										case "height":
-											gui.NationalFocusLink.Height, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										}
-									}
-								}
-							case "icontype":
-								var icon IconType
-								for _, link := range link.Links {
-									if len(link.Links) > 0 {
-										switch strings.ToLower(link.Links[0].Value) {
-										case "name":
-											icon.Name = link.Links[1].Value
-										case "position":
-											for _, link := range link.Links {
-												nodeType := pdx.ByID(link.Type)
-												switch nodeType {
-												case "declr":
-													switch strings.ToLower(link.Links[0].Value) {
-													case "x":
-														icon.Position.X, err = strconv.Atoi(link.Links[1].Value)
-														if err != nil {
-															return err
-														}
-													case "y":
-														icon.Position.Y, err = strconv.Atoi(link.Links[1].Value)
-														if err != nil {
-															return err
-														}
-													}
-												}
-											}
-										case "spritetype":
-											icon.SpriteType = link.Links[1].Value
-											gfxList = append(gfxList, "\""+link.Links[1].Value+"\"")
-										case "frame":
-											icon.Frame, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										}
-									}
-								}
-								if strings.ToLower(icon.Name) == "link" {
-									gui.Link = icon
-								}
-							}
-						}
-					}
-
-				case nfei:
-					for _, link := range node.Links {
-						if len(link.Links) > 0 {
-							switch strings.ToLower(link.Links[0].Value) {
-							case "name":
-								gui.NationalFocusExclusiveItem.Name = link.Links[1].Value
-							case "position":
-								for _, link := range link.Links {
-									nodeType := pdx.ByID(link.Type)
-									switch nodeType {
-									case "declr":
-										switch strings.ToLower(link.Links[0].Value) {
-										case "x":
-											gui.NationalFocusExclusiveItem.Position.X, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										case "y":
-											gui.NationalFocusExclusiveItem.Position.Y, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										}
-									}
-								}
-							case "size":
-								for _, link := range link.Links {
-									nodeType := pdx.ByID(link.Type)
-									switch nodeType {
-									case "declr":
-										switch strings.ToLower(link.Links[0].Value) {
-										case "width":
-											gui.NationalFocusExclusiveItem.Width, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										case "height":
-											gui.NationalFocusExclusiveItem.Height, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										}
-									}
-								}
-							case "icontype":
-								var icon IconType
-								for _, link := range link.Links {
-									if len(link.Links) > 0 {
-										switch strings.ToLower(link.Links[0].Value) {
-										case "name":
-											icon.Name = link.Links[1].Value
-										case "position":
-											for _, link := range link.Links {
-												nodeType := pdx.ByID(link.Type)
-												switch nodeType {
-												case "declr":
-													switch strings.ToLower(link.Links[0].Value) {
-													case "x":
-														icon.Position.X, err = strconv.Atoi(link.Links[1].Value)
-														if err != nil {
-															return err
-														}
-													case "y":
-														icon.Position.Y, err = strconv.Atoi(link.Links[1].Value)
-														if err != nil {
-															return err
-														}
-													}
-												}
-											}
-										case "spritetype":
-											icon.SpriteType = link.Links[1].Value
-											gfxList = append(gfxList, "\""+link.Links[1].Value+"\"")
-										case "frame":
-											icon.Frame, err = strconv.Atoi(link.Links[1].Value)
-											if err != nil {
-												return err
-											}
-										}
-									}
-								}
-								switch strings.ToLower(icon.Name) {
-								case "link1":
-									gui.Link1 = icon
-								case "link2":
-									gui.Link2 = icon
-								case "left":
-									gui.Left = icon
-								case "right":
-									gui.Right = icon
-								case "mid":
-									gui.Mid = icon
-								}
-							}
-						}
-					}
-				}
-
-			case "positiontype":
-				var name string
-				var pos image.Point
-				for _, link := range node.Links {
-					if len(link.Links) > 0 {
-						switch strings.ToLower(link.Links[0].Value) {
-						case "name":
-							name = link.Links[1].Value
-						case "position":
-							for _, link := range link.Links {
-								nodeType := pdx.ByID(link.Type)
-								switch nodeType {
-								case "declr":
-									switch strings.ToLower(link.Links[0].Value) {
-									case "x":
-										pos.X, err = strconv.Atoi(link.Links[1].Value)
-										if err != nil {
-											return err
-										}
-									case "y":
-										pos.Y, err = strconv.Atoi(link.Links[1].Value)
-										if err != nil {
-											return err
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-				switch strings.ToLower(name) {
-				case "focus_spacing":
-					gui.FocusSpacing = pos
-				case "link_spacing":
-					gui.LinkSpacing = pos
-				case "link_offsets":
-					gui.LinkOffsets = pos
-				case "link_begin":
-					gui.LinkBegin = pos
-				case "link_end":
-					gui.LinkEnd = pos
-				case "exclusive_offset":
-					gui.ExclusiveOffset = pos
-				case "exclusive_offset_left":
-					gui.ExclusiveOffsetLeft = pos
-				case "exclusive_positioning":
-					gui.ExclusivePositioning = pos
-				}
-
-			default:
-				err := traverseGUI(node)
-				if err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
+// evalAllowBranch decides whether a branch is drawn. There is no country to
+// evaluate the triggers against, so a branch is only hidden when its condition
+// is decidably false; anything we cannot judge is drawn.
+//
+// has_dlc is decided against the DLCs ticked in the window, which is what
+// makes the DLC picker work.
+func evalAllowBranch(blk *PBlock) bool {
+	return evalTriggerBlock(blk, 0) != triFalse
 }
 
-func parseGFX(path string, i int) error {
-	gfxFiles, err := WalkMatchExt(filepath.Join(path, "interface"), ".gfx")
-	if err != nil {
-		return err
+// evalTriggerBlock evaluates the children of a scope as a logical AND.
+func evalTriggerBlock(blk *PBlock, depth int) tri {
+	if blk == nil || depth > 16 {
+		return triUnknown
 	}
-	for _, fPath := range gfxFiles {
-		f, err := readFile(fPath)
-		if err != nil {
-			return err
-		}
 
-		if stringContainsSlice(f, gfxList) {
-			fmt.Println(fPath)
-			if len(f) > 0 {
-				// Remove utf-8 bom if found.
-				if bytes.HasPrefix([]byte(f), utf8bom) {
-					f = string(bytes.TrimPrefix([]byte(f), utf8bom))
-				}
-
-				node, err := pdx.Parse(f)
-				if err != nil {
-					return err
-				}
-				_ = node
-				// fmt.Println(ptool.TreeToString(node, pdx.ByID))
-				err = traverseGFX(node, path)
-				if err != nil {
-					return err
-				}
-			}
+	result := triTrue
+	for _, n := range blk.Nodes {
+		switch evalTrigger(n, depth) {
+		case triFalse:
+			return triFalse
+		case triUnknown:
+			result = triUnknown
 		}
-		pBar.SetValue(pBar.Value + 0.4/float64(i)/float64(len(gfxFiles)))
 	}
-	return nil
+	return result
 }
 
-func traverseGFX(root *ptool.TNode, path string) error {
-	var err error
-	for _, node := range root.Links {
-		nodeType := pdx.ByID(node.Type)
-		switch nodeType {
-		case "declrScope":
-			switch strings.ToLower(node.Links[0].Value) {
-			case "spritetype", "corneredtilespritetype":
-				var s SpriteType
-				for _, link := range node.Links {
-					nodeType := pdx.ByID(link.Type)
-					switch nodeType {
-					case "declr":
-						switch strings.ToLower(link.Links[0].Value) {
-						case "name":
-							s.Name = link.Links[1].Value
-						case "texturefile":
-							s.TextureFile = filepath.Join(path, link.Links[1].Value)
-						case "noofframes":
-							s.NoOfFrames, err = strconv.Atoi(link.Links[1].Value)
-							if err != nil {
-								return err
-							}
-						}
-					}
-				}
-				gfxMap[s.Name] = s
-			case "bitmapfont":
-				var b BitmapFont
-				for _, link := range node.Links {
-					nodeType := pdx.ByID(link.Type)
-					switch nodeType {
-					case "declr":
-						switch strings.ToLower(link.Links[0].Value) {
-						case "name":
-							b.Name = link.Links[1].Value
-						case "path":
-							b.Path = filepath.Join(path, link.Links[1].Value)
-						}
-					case "declrScope":
-						switch strings.ToLower(link.Links[0].Value) {
-						case "fontfiles":
-							for _, link := range link.Links {
-								nodeType := pdx.ByID(link.Type)
-								switch nodeType {
-								case "list":
-									for _, link := range link.Links {
-										nodeType := pdx.ByID(link.Type)
-										switch nodeType {
-										case "anyType":
-											b.Fontfiles = append(b.Fontfiles, filepath.Join(path, trimQuotes(link.Value)))
-										}
+// evalTriggerAny evaluates the children of a scope as a logical OR.
+func evalTriggerAny(blk *PBlock, depth int) tri {
+	if blk == nil || depth > 16 || len(blk.Nodes) == 0 {
+		return triUnknown
+	}
 
-									}
-								}
-							}
-						}
-					}
-				}
-				if len(b.Fontfiles) < 1 && b.Path != "" {
-					b.Fontfiles = append(b.Fontfiles, b.Path)
-				}
-				fontMap[b.Name] = b
-			default:
-				err = traverseGFX(node, path)
-				if err != nil {
-					return err
-				}
-			}
+	result := triFalse
+	for _, n := range blk.Nodes {
+		switch evalTrigger(n, depth) {
+		case triTrue:
+			return triTrue
+		case triUnknown:
+			result = triUnknown
 		}
 	}
-	return nil
+	return result
 }
 
-func parseLoc(path string, i int) error {
-	locFiles, err := WalkMatchExt(filepath.Join(path, "localisation"), ".yml")
-	if err != nil {
-		return err
-	}
-
-	var locReplaceFiles []string
-	if _, err := os.Stat(filepath.Join(path, "localisation", "replace")); os.IsExist(err) {
-		locReplaceFiles, err = WalkMatchExt(filepath.Join(path, "localisation", "replace"), ".yml")
-		if err != nil {
-			return err
+func evalTrigger(n *PNode, depth int) tri {
+	switch strings.ToLower(n.Key) {
+	case "always":
+		if strings.EqualFold(n.Value, "no") {
+			return triFalse
 		}
-	}
-
-	locFiles = append(locFiles, locReplaceFiles...)
-
-	for _, lPath := range locFiles {
-		f, err := readFile(lPath)
-		if err != nil {
-			return err
+		if strings.EqualFold(n.Value, "yes") {
+			return triTrue
 		}
-		if stringContainsSlice(f, locList) {
-			if len(f) > 0 {
-				// Remove utf-8 bom if found.
-				if bytes.HasPrefix([]byte(f), utf8bom) {
-					f = string(bytes.TrimPrefix([]byte(f), utf8bom))
-				}
 
-				// Skip file if it contains a wrong language.
-				if !strings.HasPrefix(strings.TrimSpace(f), language) {
-					continue
-				}
-
-				fmt.Println(lPath)
-
-				node, err := yml.Parse(f)
-				if err != nil {
-					return err
-				}
-				_ = node
-				// fmt.Println(ptool.TreeToString(node, yml.ByID))
-
-				err = traverseLoc(node)
-				if err != nil {
-					return err
-				}
-			}
+	case "has_dlc":
+		noteDLC(n.Value)
+		if dlcEnabled(n.Value) {
+			return triTrue
 		}
-		pBar.SetValue(pBar.Value + 0.4/float64(i)/float64(len(locFiles)))
+		return triFalse
+
+	case "has_country_flag":
+		// Poland's tree hides its alternative branch behind this flag.
+		if strings.EqualFold(n.Value, "romanov_enabled") {
+			return triFalse
+		}
+
+	case "not":
+		return evalTriggerAny(n.Block, depth+1).not()
+
+	case "or", "any_of":
+		return evalTriggerAny(n.Block, depth+1)
+
+	case "and", "all_of":
+		return evalTriggerBlock(n.Block, depth+1)
 	}
-	return nil
+	return triUnknown
 }
 
-func traverseLoc(root *ptool.TNode) error {
-	lang := "l_english"
-	for _, node := range root.Links {
-		nodeType := yml.ByID(node.Type)
-		switch nodeType {
-		case "language":
-			lang = node.Value
-			if _, ok := locMap[lang]; !ok {
-				locMap[lang] = make(map[string]Localisation)
-			}
-		case "pair":
-			var l Localisation
-			for _, link := range node.Links {
-				nodeType := yml.ByID(link.Type)
-				switch nodeType {
-				case "key":
-					l.Key = link.Value
-				case "number":
-					l.Number = link.Value
-				case "value":
-					l.Value = trimQuotes(link.Value)
-				}
-			}
-			locMap[lang][l.Key] = l
-		default:
-			err := traverseLoc(node)
+// pickDynamicValue reads either "icon = GFX_x" or the dynamic form
+//
+//	icon = {
+//	    GFX_a = { <triggers> }
+//	    GFX_b = yes
+//	}
+//
+// Without a country to test the triggers against, the unconditional entry is
+// the right one to draw: it is what the focus falls back to.
+func pickDynamicValue(n *PNode, kind string) string {
+	if n.Value != "" {
+		return n.Value
+	}
+	if n.Block == nil {
+		return ""
+	}
+
+	// Some mods write "text = { text = KEY trigger = { ... } }".
+	if inner := n.Block.Get(kind); inner != nil && inner.Value != "" {
+		return inner.Value
+	}
+	if inner := n.Block.Get("localization_key"); inner != nil && inner.Value != "" {
+		return inner.Value
+	}
+
+	fallback := ""
+	last := ""
+	for _, e := range n.Block.Nodes {
+		if e.Key == "" || strings.EqualFold(e.Key, "trigger") {
+			continue
+		}
+		last = e.Key
+		if strings.EqualFold(e.Value, "yes") {
+			fallback = e.Key
+		}
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return last
+}
+
+// ------------------------------------------------------------- shared focuses
+
+type sharedEntry struct {
+	Focus Focus
+	File  string
+}
+
+// loadSharedFocusPool reads every national_focus file that defines shared
+// focuses so referenced branches can be pulled into the image.
+func loadSharedFocusPool(paths []string) map[string]sharedEntry {
+	pool := make(map[string]sharedEntry)
+
+	for _, root := range paths {
+		files := walkFiles(filepath.Join(root, "common", "national_focus"), ".txt")
+		results := parseFilesConcurrently(files, func(path string) (*focusFile, bool) {
+			res, err := parseFocusFile(path)
 			if err != nil {
-				return err
+				warnf("focus file could not be read: %v: %v", path, err)
+				return nil, false
+			}
+			if !res.HasShared {
+				return nil, false
+			}
+			return res, true
+		})
+		for _, res := range results {
+			for _, f := range res.Focuses {
+				// Later paths (mods) override the game's definitions.
+				pool[f.ID] = sharedEntry{Focus: f, File: res.Path}
 			}
 		}
 	}
-	return nil
+	return pool
+}
+
+// expandSharedRefs collects each referenced shared focus together with the
+// branch hanging off it. Only focuses declared in the same file are followed,
+// which keeps an unrelated country tree from being dragged in through a
+// prerequisite that happens to point at the shared root.
+func expandSharedRefs(refs []string, pool map[string]sharedEntry) []Focus {
+	if len(refs) == 0 {
+		return nil
+	}
+
+	// Index by file so the branch walk stays inside its own file.
+	byFile := make(map[string][]sharedEntry)
+	for _, e := range pool {
+		byFile[e.File] = append(byFile[e.File], e)
+	}
+
+	visited := make(map[string]bool)
+	var out []Focus
+	queue := append([]string(nil), refs...)
+
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if visited[id] {
+			continue
+		}
+		visited[id] = true
+
+		entry, ok := pool[id]
+		if !ok {
+			warnf("shared focus %q is referenced but was not found in any national_focus file", id)
+			continue
+		}
+		out = append(out, entry.Focus)
+
+		for _, cand := range byFile[entry.File] {
+			if visited[cand.Focus.ID] {
+				continue
+			}
+			if focusDependsOn(cand.Focus, id) {
+				queue = append(queue, cand.Focus.ID)
+			}
+		}
+	}
+	return out
+}
+
+func focusDependsOn(f Focus, id string) bool {
+	if f.RelativePositionID == id {
+		return true
+	}
+	for _, group := range f.Prerequisite {
+		for _, p := range group {
+			if p == id {
+				return true
+			}
+		}
+	}
+	for _, m := range f.MutuallyExclusive {
+		if m == id {
+			return true
+		}
+	}
+	return false
+}
+
+// -------------------------------------------------------------------- the gui
+
+// loadGUI reads nationalfocusview.gui from the last search path that has one.
+func loadGUI(paths []string) bool {
+	guiPath := ""
+	for _, p := range paths {
+		candidate := filepath.Join(p, "interface", "nationalfocusview.gui")
+		if fileExists(candidate) {
+			guiPath = candidate
+		}
+	}
+	if guiPath == "" {
+		errorf("nationalfocusview.gui was not found in the game folder or any selected mod")
+		return false
+	}
+
+	src, err := readFileText(guiPath)
+	if err != nil {
+		errorf("nationalfocusview.gui could not be read: %v", err)
+		return false
+	}
+
+	infof("interface layout: %v", guiPath)
+	traverseGUI(ParsePDX(src, "nationalfocusview.gui"))
+
+	if gui.FocusSpacing.X == 0 || gui.FocusSpacing.Y == 0 {
+		warnf("focus_spacing was missing from the gui file, falling back to the vanilla 96x130 grid")
+		if gui.FocusSpacing.X == 0 {
+			gui.FocusSpacing.X = 96
+		}
+		if gui.FocusSpacing.Y == 0 {
+			gui.FocusSpacing.Y = 130
+		}
+	}
+	if gui.NationalFocusItem.Width == 0 {
+		gui.NationalFocusItem.Width = 96
+	}
+	if gui.NationalFocusItem.Height == 0 {
+		gui.NationalFocusItem.Height = 96
+	}
+	return true
+}
+
+func pointOf(n *PNode) image.Point {
+	var p image.Point
+	if n == nil || n.Block == nil {
+		return p
+	}
+	if v, ok := n.Block.Int("x"); ok {
+		p.X = v
+	}
+	if v, ok := n.Block.Int("y"); ok {
+		p.Y = v
+	}
+	return p
+}
+
+func traverseGUI(blk *PBlock) {
+	if blk == nil {
+		return
+	}
+	for _, n := range blk.Nodes {
+		if n.Block == nil {
+			continue
+		}
+		switch strings.ToLower(n.Key) {
+		case "containerwindowtype":
+			switch strings.ToLower(n.Block.Str("name")) {
+			case "nationalfocusview":
+				readFocusViewContainer(n.Block)
+			case "national_focus_item":
+				readFocusItemContainer(n.Block)
+			case "national_focus_link":
+				readFocusLinkContainer(n.Block)
+			case "national_focus_exclusive_item":
+				readExclusiveItemContainer(n.Block)
+			}
+			traverseGUI(n.Block)
+
+		case "positiontype":
+			readPositionType(n.Block)
+
+		default:
+			traverseGUI(n.Block)
+		}
+	}
+}
+
+func readTextbox(blk *PBlock) InstantTextboxType {
+	var t InstantTextboxType
+	t.Name = blk.Str("name")
+	t.Position = pointOf(blk.Get("position"))
+	t.Font = blk.Str("font")
+	t.Text = blk.Str("text")
+	t.Format = blk.Str("format")
+	t.Orientation = blk.Str("orientation")
+	t.VerticalAlignment = blk.Str("vertical_alignment")
+	if v, ok := blk.Int("maxwidth"); ok {
+		t.MaxWidth = v
+	}
+	if v, ok := blk.Int("maxheight"); ok {
+		t.MaxHeight = v
+	}
+	return t
+}
+
+func readButton(blk *PBlock) ButtonType {
+	var b ButtonType
+	b.Name = blk.Str("name")
+	b.Position = pointOf(blk.Get("position"))
+	b.SpriteType = blk.Str("spriteType")
+	if b.SpriteType == "" {
+		b.SpriteType = blk.Str("quadTextureSprite")
+	}
+	b.CenterPosition = blk.Str("centerPosition")
+	b.Orientation = blk.Str("orientation")
+	return b
+}
+
+func readIcon(blk *PBlock) IconType {
+	var i IconType
+	i.Name = blk.Str("name")
+	i.Position = pointOf(blk.Get("position"))
+	i.SpriteType = blk.Str("spriteType")
+	if i.SpriteType == "" {
+		i.SpriteType = blk.Str("quadTextureSprite")
+	}
+	if v, ok := blk.Int("frame"); ok {
+		i.Frame = v
+	}
+	return i
+}
+
+func readContainer(blk *PBlock) ContainerWindowType {
+	var c ContainerWindowType
+	c.Name = blk.Str("name")
+	c.Position = pointOf(blk.Get("position"))
+	if size := blk.Get("size"); size != nil && size.Block != nil {
+		if v, ok := size.Block.Int("width"); ok {
+			c.Width = v
+		}
+		if v, ok := size.Block.Int("height"); ok {
+			c.Height = v
+		}
+	}
+	return c
+}
+
+func readFocusViewContainer(blk *PBlock) {
+	for _, n := range blk.GetAll("instantTextBoxType") {
+		if n.Block == nil {
+			continue
+		}
+		t := readTextbox(n.Block)
+		if strings.EqualFold(t.Name, "national_focus_title") {
+			gui.NationalFocusTitle = t
+		}
+	}
+}
+
+func readFocusItemContainer(blk *PBlock) {
+	gui.NationalFocusItem = readContainer(blk)
+
+	for _, n := range blk.GetAll("buttonType") {
+		if n.Block == nil {
+			continue
+		}
+		b := readButton(n.Block)
+		switch strings.ToLower(b.Name) {
+		case "bg":
+			gui.BG = b
+		case "symbol":
+			gui.Symbol = b
+		}
+	}
+
+	for _, n := range blk.GetAll("instantTextBoxType") {
+		if n.Block == nil {
+			continue
+		}
+		t := readTextbox(n.Block)
+		if strings.EqualFold(t.Name, "name") {
+			gui.Name = t
+		}
+	}
+}
+
+func readFocusLinkContainer(blk *PBlock) {
+	gui.NationalFocusLink = readContainer(blk)
+	for _, n := range blk.GetAll("iconType") {
+		if n.Block == nil {
+			continue
+		}
+		i := readIcon(n.Block)
+		if strings.EqualFold(i.Name, "link") {
+			gui.Link = i
+		}
+	}
+}
+
+func readExclusiveItemContainer(blk *PBlock) {
+	gui.NationalFocusExclusiveItem = readContainer(blk)
+	for _, n := range blk.GetAll("iconType") {
+		if n.Block == nil {
+			continue
+		}
+		i := readIcon(n.Block)
+		switch strings.ToLower(i.Name) {
+		case "link1":
+			gui.Link1 = i
+		case "link2":
+			gui.Link2 = i
+		case "left":
+			gui.Left = i
+		case "right":
+			gui.Right = i
+		case "mid":
+			gui.Mid = i
+		}
+	}
+}
+
+func readPositionType(blk *PBlock) {
+	pos := pointOf(blk.Get("position"))
+	switch strings.ToLower(blk.Str("name")) {
+	case "focus_spacing":
+		gui.FocusSpacing = pos
+	case "link_spacing":
+		gui.LinkSpacing = pos
+	case "link_offsets":
+		gui.LinkOffsets = pos
+	case "link_begin":
+		gui.LinkBegin = pos
+	case "link_end":
+		gui.LinkEnd = pos
+	case "exclusive_offset":
+		gui.ExclusiveOffset = pos
+	case "exclusive_offset_left":
+		gui.ExclusiveOffsetLeft = pos
+	case "exclusive_positioning":
+		gui.ExclusivePositioning = pos
+	}
+}
+
+// -------------------------------------------------------------------- sprites
+
+type gfxResult struct {
+	Sprites map[string]SpriteType
+	Fonts   map[string]BitmapFont
+}
+
+// loadGFX reads every .gfx file under interface/ in each search path.
+//
+// The old version only opened files whose raw text contained one of the sprite
+// names it was looking for, which quietly lost sprites declared through a
+// different spelling. Reading them all is both simpler and, with the new
+// parser, faster than the substring scan it replaced.
+func loadGFX(paths []string, progress func(float64)) {
+	step := 0.0
+	if len(paths) > 0 {
+		step = 1.0 / float64(len(paths))
+	}
+
+	for _, root := range paths {
+		files := walkFiles(filepath.Join(root, "interface"), ".gfx")
+		results := parseFilesConcurrently(files, func(path string) (gfxResult, bool) {
+			src, err := readFileText(path)
+			if err != nil {
+				warnf("gfx file could not be read: %v: %v", path, err)
+				return gfxResult{}, false
+			}
+			res := gfxResult{
+				Sprites: make(map[string]SpriteType),
+				Fonts:   make(map[string]BitmapFont),
+			}
+			traverseGFX(ParsePDX(src, filepath.Base(path)), root, &res)
+			if len(res.Sprites) == 0 && len(res.Fonts) == 0 {
+				return gfxResult{}, false
+			}
+			return res, true
+		})
+
+		for _, res := range results {
+			for k, v := range res.Sprites {
+				gfxMap[k] = v
+			}
+			for k, v := range res.Fonts {
+				fontMap[k] = v
+			}
+		}
+
+		if progress != nil {
+			progress(step)
+		}
+	}
+}
+
+func traverseGFX(blk *PBlock, root string, out *gfxResult) {
+	if blk == nil {
+		return
+	}
+	for _, n := range blk.Nodes {
+		if n.Block == nil {
+			continue
+		}
+		key := strings.ToLower(n.Key)
+		switch {
+		case spriteTypeKeys[key]:
+			var s SpriteType
+			s.Name = n.Block.Str("name")
+			if s.Name == "" {
+				continue
+			}
+			if tf := n.Block.Str("textureFile"); tf != "" {
+				s.TextureFile = filepath.Join(root, filepath.FromSlash(tf))
+			}
+			if v, ok := n.Block.Int("noOfFrames"); ok {
+				s.NoOfFrames = v
+			}
+			if s.NoOfFrames < 1 {
+				s.NoOfFrames = 1
+			}
+			out.Sprites[s.Name] = s
+
+		case key == "bitmapfont":
+			var b BitmapFont
+			b.Name = n.Block.Str("name")
+			if b.Name == "" {
+				continue
+			}
+			if p := n.Block.Str("path"); p != "" {
+				b.Path = filepath.Join(root, filepath.FromSlash(p))
+			}
+			if ff := n.Block.Get("fontfiles"); ff != nil && ff.Block != nil {
+				for _, v := range ff.Block.Values {
+					b.Fontfiles = append(b.Fontfiles, filepath.Join(root, filepath.FromSlash(v)))
+				}
+			}
+			if len(b.Fontfiles) == 0 && b.Path != "" {
+				b.Fontfiles = append(b.Fontfiles, b.Path)
+			}
+			out.Fonts[b.Name] = b
+
+		default:
+			traverseGFX(n.Block, root, out)
+		}
+	}
 }

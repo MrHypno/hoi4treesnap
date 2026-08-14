@@ -13,4 +13,7 @@
 
 *.png
 !icon.png
+!docs/*.png
 hoi4treesnapGamePath.txt
+hoi4treesnap.json
+hoi4treesnap.log

@@ -1,101 +1,139 @@
 package main
 
 import (
-	"fmt"
 	"image"
 	"io/fs"
-	"io/ioutil"
-	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/widget"
-	"github.com/k0kubun/go-ansi"
-	"github.com/macroblock/imed/pkg/ptool"
 	"github.com/malashin/bmfonter"
 )
 
-func nodesToString(node *ptool.TNode) []string {
-	s := []string{}
-	for _, n := range node.Links {
-		s = append(s, nodesToString(n)...)
+// walkFiles returns every file under root with the given extension. A missing
+// folder is not an error: mods routinely ship without an interface or
+// localisation folder.
+func walkFiles(root, ext string) []string {
+	if !dirExists(root) {
+		return nil
 	}
-	if node.Value != "" {
-		s = append(s, node.Value)
-	}
-	return s
-}
-
-func readFile(path string) (string, error) {
-	f, err := ioutil.ReadFile(path)
+	var match []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			warnf("folder could not be read: %v: %v", p, err)
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.EqualFold(filepath.Ext(d.Name()), ext) {
+			match = append(match, p)
+		}
+		return nil
+	})
 	if err != nil {
-		return "", err
+		warnf("folder could not be read: %v: %v", root, err)
 	}
-	return string(f), nil
+	sort.Strings(match)
+	return match
 }
 
-func trimQuotes(s string) string {
-	s = strings.TrimSpace(s)
-	if len(s) >= 2 {
-		if s[0] == '"' && s[len(s)-1] == '"' {
-			return s[1 : len(s)-1]
+// parseFilesConcurrently runs fn over every path on all cores and returns the
+// results in the original order, so later files still override earlier ones.
+func parseFilesConcurrently[T any](paths []string, fn func(string) (T, bool)) []T {
+	if len(paths) == 0 {
+		return nil
+	}
+
+	type slot struct {
+		value T
+		ok    bool
+	}
+	slots := make([]slot, len(paths))
+
+	workers := runtime.NumCPU()
+	if workers > len(paths) {
+		workers = len(paths)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var wg sync.WaitGroup
+	jobs := make(chan int)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				v, ok := fn(paths[i])
+				slots[i] = slot{value: v, ok: ok}
+			}
+		}()
+	}
+	for i := range paths {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	out := make([]T, 0, len(paths))
+	for _, s := range slots {
+		if s.ok {
+			out = append(out, s.value)
 		}
 	}
-	return s
+	return out
 }
 
-func encodeCacheFile(i interface{}, path string) error {
-	err := e.Encode(i)
-	if err != nil {
-		return err
-	}
-	err = ioutil.WriteFile(path, buf.Bytes(), 0755)
-	if err != nil {
-		return err
-	}
-	buf.Reset()
-	return nil
-}
+// fillAbsoluteFocusPositions turns relative_position_id coordinates into
+// absolute ones. The iteration count is capped so that a mod with a circular
+// reference reports the problem instead of hanging the program.
+func fillAbsoluteFocusPositions() {
+	const maxPasses = 64
 
-func decodeCacheFile(i interface{}, path string) error {
-	b, err := ioutil.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	_, err = buf.Write(b)
-	if err != nil {
-		return err
-	}
-	err = d.Decode(i)
-	if err != nil {
-		return err
-	}
-	buf.Reset()
-	return nil
-}
-
-func fillAbsoluteFocusPositions(finished bool) bool {
-	for _, f1 := range focusMap {
-		if f1.RelativePositionID == "" {
+	for pass := 0; pass < maxPasses; pass++ {
+		changed := false
+		for _, f1 := range focusMap {
+			if f1.RelativePositionID != "" {
+				continue
+			}
 			for _, f2 := range focusMap {
-				if f2.RelativePositionID == f1.ID {
-					f2.X += focusMap[f1.ID].X
-					f2.Y += focusMap[f1.ID].Y
-					f2.RelativePositionID = ""
-					focusMap[f2.ID] = f2
-					finished = false
+				if f2.RelativePositionID != f1.ID {
+					continue
 				}
+				f2.X += f1.X
+				f2.Y += f1.Y
+				f2.RelativePositionID = ""
+				focusMap[f2.ID] = f2
+				changed = true
 			}
 		}
+		if !changed {
+			break
+		}
 	}
-	if !finished {
-		finished = fillAbsoluteFocusPositions(true)
+
+	// Anything still relative points at a focus that is missing or part of a
+	// loop. Leave it where it is and say so rather than dropping it.
+	for _, f := range focusMap {
+		if f.RelativePositionID == "" {
+			continue
+		}
+		if _, ok := focusMap[f.RelativePositionID]; !ok {
+			warnf("focus %v is positioned relative to %q which is not in this tree, drawing it at its own coordinates", f.ID, f.RelativePositionID)
+		} else {
+			warnf("focus %v is part of a circular relative_position_id chain, drawing it at its own coordinates", f.ID)
+		}
+		f.RelativePositionID = ""
+		focusMap[f.ID] = f
 	}
-	return finished
 }
 
 func moveAbsoluteFocusPositionsToPositiveValues() {
@@ -118,33 +156,34 @@ func moveAbsoluteFocusPositionsToPositiveValues() {
 		for _, f := range focusMap {
 			f.X -= lowestX
 			f.Y -= lowestY
-
 			focusMap[f.ID] = f
 		}
 	}
 }
 
-// buildFocusTree adds children data to each focus.
-// Sorts children by X coordinate from left to right.
+// fillFocusChildAndParentData adds children data to each focus and works out
+// which line segment each connection needs. Children are sorted left to right.
 func fillFocusChildAndParentData() {
 	for _, c := range focusMap {
 		for _, g := range c.Prerequisite {
-			solid := true
-			if len(g) > 1 {
-				solid = false
-			}
-			for _, f := range g {
-				p := focusMap[f]
+			solid := len(g) <= 1
+			for _, id := range g {
+				p, ok := focusMap[id]
+				if !ok {
+					warnf("focus %v lists %q as a prerequisite but that focus is not in this tree", c.ID, id)
+					continue
+				}
 				p.Children = append(p.Children, Child{c.ID, solid})
 				focusMap[p.ID] = p
 			}
 		}
 	}
 
+	visited := make(map[string]bool, len(focusMap))
 	for _, f := range focusMap {
 		sort.Slice(f.Children, func(i, j int) bool { return focusMap[f.Children[i].ID].X < focusMap[f.Children[j].ID].X })
 		focusMap[f.ID] = f
-		fillAllowBranchData(f)
+		fillAllowBranchData(f, visited)
 	}
 
 	for _, p := range focusMap {
@@ -205,8 +244,8 @@ func fillFocusChildAndParentData() {
 			}
 
 			for _, pSlice := range c.Prerequisite {
-				for _, p2 := range pSlice {
-					p2 := focusMap[p2]
+				for _, id := range pSlice {
+					p2 := focusMap[id]
 					if p.Y > p2.Y {
 						a.Set(U)
 					}
@@ -286,16 +325,7 @@ func containsInt(s []int, a int) bool {
 
 func containsString(s []string, a string) bool {
 	for _, b := range s {
-		if a == b {
-			return true
-		}
-	}
-	return false
-}
-
-func containsPoint(s []image.Point, a image.Point) bool {
-	for _, b := range s {
-		if a == b {
+		if strings.EqualFold(a, b) {
 			return true
 		}
 	}
@@ -308,7 +338,6 @@ func maxFocusPos(m map[string]Focus) (x, y int) {
 		if !f.AllowBranch {
 			continue
 		}
-
 		if f.X > x {
 			x = f.X
 		}
@@ -319,29 +348,33 @@ func maxFocusPos(m map[string]Focus) (x, y int) {
 	return
 }
 
-func fillAllowBranchData(f Focus) {
-	if !f.AllowBranch {
-		for _, child := range f.Children {
-			c := focusMap[child.ID]
+// fillAllowBranchData hides the children of a hidden branch. The visited set
+// stops a prerequisite loop from recursing forever.
+func fillAllowBranchData(f Focus, visited map[string]bool) {
+	if f.AllowBranch || visited[f.ID] {
+		return
+	}
+	visited[f.ID] = true
 
-			allowBranchInGroup := false
-			for _, parentGroup := range c.Prerequisite {
-				allowBranchInGroup = false
-				for _, parent := range parentGroup {
-					if focusMap[parent].AllowBranch {
-						allowBranchInGroup = true
-					}
-				}
+	for _, child := range f.Children {
+		c := focusMap[child.ID]
 
-				if !allowBranchInGroup {
-					break
+		allowBranchInGroup := false
+		for _, parentGroup := range c.Prerequisite {
+			allowBranchInGroup = false
+			for _, parent := range parentGroup {
+				if focusMap[parent].AllowBranch {
+					allowBranchInGroup = true
 				}
 			}
-
-			c.AllowBranch = allowBranchInGroup
-			focusMap[child.ID] = c
-			fillAllowBranchData(c)
+			if !allowBranchInGroup {
+				break
+			}
 		}
+
+		c.AllowBranch = allowBranchInGroup
+		focusMap[child.ID] = c
+		fillAllowBranchData(c, visited)
 	}
 }
 
@@ -355,123 +388,137 @@ func maxYinRange(m map[int]FocusLine, y int) int {
 	return max
 }
 
-func stringContainsSlice(s string, slice []string) bool {
-	for _, substr := range slice {
-		c := strings.Contains(s, substr)
-		if c {
-			return true
-		}
-	}
-	return false
-}
-
+// useModsTexturesIfPresent lets a mod replace a texture the game declares
+// without redeclaring the sprite.
 func useModsTexturesIfPresent() {
 	if len(modPaths) <= 1 {
 		return
 	}
 	for k, v := range gfxMap {
-		if strings.HasPrefix(v.TextureFile, gamePath) {
-			gfx := strings.TrimPrefix(v.TextureFile, gamePath)
-			for _, p := range modPaths[1:] {
-				if _, err := os.Stat(filepath.Join(p, gfx)); err == nil {
-					v.TextureFile = filepath.Join(p, gfx)
-					gfxMap[k] = v
-				}
+		if v.TextureFile == "" || !strings.HasPrefix(v.TextureFile, modPaths[0]) {
+			continue
+		}
+		rel := strings.TrimPrefix(v.TextureFile, modPaths[0])
+		for _, p := range modPaths[1:] {
+			if fileExists(filepath.Join(p, rel)) {
+				v.TextureFile = filepath.Join(p, rel)
+				gfxMap[k] = v
 			}
 		}
 	}
 }
 
+// replaceFontPathsIfNotFound falls back to the game's copy of a font when a
+// mod declares one but does not ship the files.
 func replaceFontPathsIfNotFound() {
 	if len(modPaths) <= 1 {
 		return
 	}
+	game := modPaths[0]
 
 	for fontName, fontBitmap := range fontMap {
 		for i, filePath := range fontBitmap.Fontfiles {
-			if _, err := os.Stat(filePath + ".fnt"); err != nil {
-				for _, modPath := range modPaths[1:] {
-					if strings.HasPrefix(filePath, modPath) {
-						filePath = filepath.Join(gamePath, strings.TrimPrefix(filePath, modPath))
-						if _, err := os.Stat(filePath + ".fnt"); err == nil {
-							fontBitmap.Fontfiles[i] = filePath
-							fontMap[fontName] = fontBitmap
-						}
-					}
+			if fileExists(filePath + ".fnt") {
+				continue
+			}
+			for _, modPath := range modPaths[1:] {
+				if !strings.HasPrefix(filePath, modPath) {
+					continue
+				}
+				candidate := filepath.Join(game, strings.TrimPrefix(filePath, modPath))
+				if fileExists(candidate + ".fnt") {
+					fontBitmap.Fontfiles[i] = candidate
+					fontMap[fontName] = fontBitmap
+					break
 				}
 			}
 		}
 	}
 }
 
-func initFont(fontName string) (bmfonter.Font, error) {
+// fallbackFonts are tried in order when the font the gui asks for is missing.
+var fallbackFonts = []string{
+	"hoi_16mbs", "hoi_18mbs", "hoi_20b", "hoi_20mbs",
+	"Arial12", "vic_18", "vic_16",
+}
+
+// initFont loads a bitmap font, falling back to a similar one instead of
+// aborting the whole image when the requested one cannot be loaded.
+func initFont(fontName string) (bmfonter.Font, bool) {
+	if f, ok := tryInitFont(fontName); ok {
+		return f, true
+	}
+
+	for _, name := range fallbackFonts {
+		if strings.EqualFold(name, fontName) {
+			continue
+		}
+		if f, ok := tryInitFont(name); ok {
+			warnf("font %q could not be loaded, using %q instead", fontName, name)
+			return f, true
+		}
+	}
+
+	// Last resort: any font that loads at all.
+	names := make([]string, 0, len(fontMap))
+	for name := range fontMap {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if f, ok := tryInitFont(name); ok {
+			warnf("font %q could not be loaded, using %q instead", fontName, name)
+			return f, true
+		}
+	}
+
+	errorf("no usable bitmap font was found, focus names will be left blank")
+	return bmfonter.Font{}, false
+}
+
+func tryInitFont(fontName string) (bmfonter.Font, bool) {
 	var font bmfonter.Font
+	if fontName == "" {
+		return font, false
+	}
+
 	bmfont, ok := fontMap[fontName]
 	if !ok {
-		return font, fmt.Errorf("font \"" + fontName + "\" not found")
+		warnf("font %q is not declared in any .gfx file", fontName)
+		return font, false
+	}
+	if len(bmfont.Fontfiles) == 0 {
+		warnf("font %q has no associated files", fontName)
+		return font, false
 	}
 
-	if len(bmfont.Fontfiles) < 1 {
-		return font, fmt.Errorf("font \"" + fontName + "\" has no associated files")
-	}
-
-	// Init font.
 	font, err := bmfonter.InitFont(bmfont.Fontfiles[0]+".fnt", bmfont.Fontfiles[0]+".dds")
 	if err != nil {
-		return font, err
+		warnf("font %q could not be loaded: %v", fontName, err)
+		return font, false
 	}
 
-	if len(bmfont.Fontfiles) > 1 {
-		for i := 1; i < len(bmfont.Fontfiles); i++ {
-			err = font.AddSubFont(bmfont.Fontfiles[i]+".fnt", bmfont.Fontfiles[i]+".dds")
-			return font, err
+	// The original returned right after the first sub font, so a font with
+	// three files only ever got two of them.
+	for i := 1; i < len(bmfont.Fontfiles); i++ {
+		if err := font.AddSubFont(bmfont.Fontfiles[i]+".fnt", bmfont.Fontfiles[i]+".dds"); err != nil {
+			warnf("sub font %v of %q could not be loaded: %v", filepath.Base(bmfont.Fontfiles[i]), fontName, err)
 		}
 	}
-
-	return font, nil
+	return font, true
 }
 
-func showError(err error) {
-	ansi.Println("\x1b[31;1m" + err.Error() + "\x1b[0m")
-
-	w := fyne.CurrentApp().NewWindow("Error")
-	w.SetContent(fyne.NewContainerWithLayout(layout.NewCenterLayout(), widget.NewLabel(err.Error())))
-
-	w.SetContent(
-		container.NewVBox(
-			widget.NewLabel(err.Error()),
-			widget.NewButton("Ok", func() { w.Close() }),
-		),
-	)
-
-	w.CenterOnScreen()
-	w.Show()
-	w.RequestFocus()
-
-	pBar.Hide()
-	pBar.SetValue(0)
-	running = false
-	return
-}
-
-func WalkMatchExt(root, ext string) ([]string, error) {
-	var match []string
-
-	err := filepath.WalkDir(root, func(s string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if filepath.Ext(d.Name()) == ext {
-			match = append(match, s)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
+// openFolder shows a folder in the system file manager.
+func openFolder(path string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("explorer", filepath.Clean(path))
+	case "darwin":
+		cmd = exec.Command("open", path)
+	default:
+		cmd = exec.Command("xdg-open", path)
 	}
-
-	return match, nil
+	// explorer.exe reports a non zero exit code even when it worked.
+	_ = cmd.Start()
 }

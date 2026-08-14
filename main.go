@@ -1,17 +1,11 @@
 package main
 
 import (
-	"bytes"
-	"encoding/gob"
 	"image"
 	"os"
 	"path/filepath"
 
-	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/widget"
-	"github.com/macroblock/imed/pkg/ptool"
-	"github.com/malashin/bmfonter"
 	_ "github.com/malashin/dds"
 
 	// TGA must be the last registered image format due to not having magic prefix.
@@ -19,27 +13,33 @@ import (
 	_ "github.com/ftrvxmtrx/tga"
 )
 
-var focusTreePaths, modPaths []string
-var gamePath, binPath string
-var running, isLineRenderingOff bool
-var win fyne.Window
-var pBar *widget.ProgressBar
+const appVersion = "0.6.0"
 
-var language = "l_english"
-var spacingX = 131
-var spacingY = 63
+var (
+	binPath string
+	cfg     Config
+)
 
-var focusMap = make(map[string]Focus)
-var gfxMap = make(map[string]SpriteType)
-var fontMap = make(map[string]BitmapFont)
-var locMap = make(map[string]map[string]Localisation)
-var gui FocusGUI
-var font, fontTreeTitle bmfonter.Font
-var locList, gfxList []string
+// modPaths is the search order used for every lookup: the game folder first,
+// then each dependency mod, then the mod the selected focus tree lives in.
+// Later entries win when the same asset is declared twice.
+var modPaths []string
 
-var buf = new(bytes.Buffer)
-var e = gob.NewEncoder(buf)
-var d = gob.NewDecoder(buf)
+var (
+	focusMap    = make(map[string]Focus)
+	gfxMap      = make(map[string]SpriteType)
+	fontMap     = make(map[string]BitmapFont)
+	locMap      = make(map[string]string)
+	scriptedLoc = make(map[string]string)
+	gui         FocusGUI
+)
+
+const (
+	spacingX = 131
+	spacingY = 63
+)
+
+type Dir int
 
 const (
 	U Dir = 1
@@ -49,31 +49,30 @@ const (
 	S Dir = 16
 )
 
-var UDdash image.Image
-var ULdash image.Image
-var URdash image.Image
-var DLdash image.Image
-var DRdash image.Image
-var LRdash image.Image
-var UDLdash image.Image
-var UDRdash image.Image
-var ULRdash image.Image
-var DLRdash image.Image
-var UDLRdash image.Image
-var UD image.Image
-var UL image.Image
-var UR image.Image
-var DL image.Image
-var DR image.Image
-var LR image.Image
-var UDL image.Image
-var UDR image.Image
-var ULR image.Image
-var DLR image.Image
-var UDLR image.Image
-
-var pdx *ptool.TParser
-var yml *ptool.TParser
+var (
+	UDdash   image.Image
+	ULdash   image.Image
+	URdash   image.Image
+	DLdash   image.Image
+	DRdash   image.Image
+	LRdash   image.Image
+	UDLdash  image.Image
+	UDRdash  image.Image
+	ULRdash  image.Image
+	DLRdash  image.Image
+	UDLRdash image.Image
+	UD       image.Image
+	UL       image.Image
+	UR       image.Image
+	DL       image.Image
+	DR       image.Image
+	LR       image.Image
+	UDL      image.Image
+	UDR      image.Image
+	ULR      image.Image
+	DLR      image.Image
+	UDLR     image.Image
+)
 
 var utf8bom = []byte{0xEF, 0xBB, 0xBF}
 
@@ -88,6 +87,8 @@ type Focus struct {
 	MutuallyExclusive  []string
 	AllowBranch        bool
 	Available          bool
+	Shared             bool
+	Source             string
 	Children           []Child
 	In                 map[int]FocusLine
 	Out                FocusLine
@@ -102,8 +103,6 @@ type FocusLine struct {
 	Dir Dir
 }
 
-type Dir int
-
 type SpriteType struct {
 	Name        string
 	TextureFile string
@@ -115,12 +114,6 @@ type BitmapFont struct {
 	Name      string
 	Path      string
 	Fontfiles []string
-}
-
-type Localisation struct {
-	Key    string
-	Number string
-	Value  string
 }
 
 type FocusGUI struct {
@@ -184,10 +177,15 @@ type IconType struct {
 func main() {
 	bin, err := os.Executable()
 	if err != nil {
-		panic(err)
+		// Falling back to the working directory is better than refusing to start.
+		bin, _ = os.Getwd()
+		binPath = bin
+	} else {
+		binPath = filepath.Dir(bin)
 	}
-	binPath = filepath.Dir(bin)
 
-	app := app.New()
-	setupUI(app)
+	cfg = loadConfig()
+
+	a := app.New()
+	setupUI(a)
 }
