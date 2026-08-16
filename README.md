@@ -5,14 +5,32 @@ The tool itself does not contain any textures and picks them up from the HOI4 ba
 This is a fork of [malashin/hoi4treesnap](https://github.com/malashin/hoi4treesnap) with a rewritten parser, shared focus support and a reworked window. See [What is different in this fork](#what-is-different-in-this-fork).
 
 ### How to use:
-1. Download and run the latest `hoi4treesnap.exe`.
+1. Download and run the latest build. Windows: `hoi4treesnap.exe`. macOS: unzip `TreeSnap.app` (see [macOS](#macos) below).
 2. Select focus tree file from `/common/national_focus`.
 3. Select Hearts of Iron IV game folder.
 4. If you need other mods, dependencies for example, add those.
 5. Pick a localisation language if you do not want English. The list is the ten languages the base game ships.
-6. Press `Generate image`. Output is saved next to the binary unless you pick another output folder.
+6. Press `Generate image`. Output is saved next to the program unless you pick another output folder.
 
-Every selection is saved to `hoi4treesnap.json` next to the binary, so after the first run only the focus tree has to be picked again. The window always shows which folders are currently selected.
+Every selection is saved to `hoi4treesnap.json` next to the program, so after the first run only the focus tree has to be picked again. The window always shows which folders are currently selected.
+
+### macOS
+
+The app is not signed, so the first launch has to go through Gatekeeper: right click `TreeSnap.app` and choose `Open`, then confirm. Double clicking it before that will be refused. From Terminal the same thing is done with
+
+```
+xattr -dr com.apple.quarantine TreeSnap.app
+```
+
+Settings, the log and the generated images are written next to the `.app`, not inside it.
+
+Paradox ships its macOS builds as an application bundle, and depending on the title the game data sits either next to it or inside `Contents/Resources`. Either works: point `Hearts of Iron IV folder` at the Steam folder or at the bundle itself and the data is found. The Steam folder is usually
+
+```
+~/Library/Application Support/Steam/steamapps/common/Hearts of Iron IV
+```
+
+and mods are under `~/Documents/Paradox Interactive/Hearts of Iron IV/mod/`.
 
 ### What is different in this fork
 
@@ -35,19 +53,29 @@ Every selection is saved to `hoi4treesnap.json` next to the binary, so after the
 ### Known issues:
 * There is no country name in the image.
 * Conditional `offset = { ... }` blocks on a focus are ignored, the base coordinates are used.
+* On a case sensitive volume a texture whose `texturefile` does not match the file name exactly will not be found. macOS and Windows are case insensitive by default, so this only shows up on Linux or a case sensitive Mac volume.
 
 ### Building
 
-Requires Go and a C compiler (Fyne needs cgo on Windows).
+Requires Go and a C compiler, since Fyne needs cgo. There is no cross compiling: each platform has to be built on itself, which is what the [build workflow](.github/workflows/build.yml) does.
+
+Windows:
 
 ```
-go build -ldflags "-H=windowsgui -s -w" -o hoi4treesnap.exe .
+go build -trimpath -ldflags "-H=windowsgui -s -w" -o hoi4treesnap.exe .
+```
+
+macOS, as an application bundle:
+
+```
+go install fyne.io/tools/cmd/fyne@latest
+fyne package -os darwin
 ```
 
 Tests that need a real installation are skipped unless `HOI4_PATH` is set:
 
 ```
-go test .
+go test ./...
 ```
 
 ### Menu:

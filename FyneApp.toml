@@ -1,0 +1,8 @@
+Website = "https://github.com/MrHypno/hoi4treesnap"
+
+[Details]
+Icon = "icon.png"
+Name = "TreeSnap"
+ID = "io.github.mrhypno.hoi4treesnap"
+Version = "0.6.0"
+Build = 2

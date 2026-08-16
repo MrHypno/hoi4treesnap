@@ -476,11 +476,16 @@ func (u *ui) selectGameFolder() {
 		if dir == "" {
 			return
 		}
-		if !dirExists(filepath.Join(dir, "interface")) {
-			dialog.ShowError(errors.New("that folder has no interface subfolder, it does not look like a HOI4 installation"), u.win)
+		resolved, ok := resolveGameFolder(dir)
+		if !ok {
+			dialog.ShowError(errors.New("that folder holds no interface, common or localisation subfolder, "+
+				"so it does not look like a HOI4 installation"), u.win)
 			return
 		}
-		cfg.GamePath = dir
+		if resolved != dir {
+			infof("game data found inside %v", resolved)
+		}
+		cfg.GamePath = resolved
 		cfg.save()
 		u.refreshGame()
 	})

@@ -3,7 +3,6 @@ package main
 import (
 	"image"
 	"os"
-	"path/filepath"
 
 	"fyne.io/fyne/v2/app"
 	_ "github.com/malashin/dds"
@@ -178,10 +177,9 @@ func main() {
 	bin, err := os.Executable()
 	if err != nil {
 		// Falling back to the working directory is better than refusing to start.
-		bin, _ = os.Getwd()
-		binPath = bin
+		binPath, _ = os.Getwd()
 	} else {
-		binPath = filepath.Dir(bin)
+		binPath = resolveBinPath(bin)
 	}
 
 	cfg = loadConfig()

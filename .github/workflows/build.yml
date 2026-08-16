@@ -1,0 +1,94 @@
+name: build
+
+# Fyne needs cgo, so every target has to be built on its own machine. This is
+# what verifies the macOS build: there is no way to produce or test one from a
+# Windows checkout.
+
+on:
+  # Every branch, so a change can be checked on a branch before it reaches
+  # master.
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - run: go vet ./...
+
+      - run: go test ./...
+
+  macos-app:
+    name: macOS app (${{ matrix.arch }})
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+          - arch: intel
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Install the Fyne packaging tool
+        run: go install fyne.io/tools/cmd/fyne@latest
+
+      - name: Build the app bundle
+        run: fyne package -os darwin
+
+      # ditto keeps the bundle's structure and permissions, which a plain zip
+      # does not.
+      - name: Compress the bundle
+        run: ditto -c -k --keepParent TreeSnap.app hoi4treesnap_macos_${{ matrix.arch }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hoi4treesnap_macos_${{ matrix.arch }}
+          path: hoi4treesnap_macos_${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  windows-exe:
+    name: Windows exe
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Build
+        run: go build -trimpath -ldflags "-H=windowsgui -s -w" -o hoi4treesnap_win64.exe .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hoi4treesnap_win64
+          path: hoi4treesnap_win64.exe
+          if-no-files-found: error
